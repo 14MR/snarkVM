@@ -32,9 +32,12 @@ use aleo_std_storage::StorageMode;
 use anyhow::Result;
 use core::marker::PhantomData;
 use indexmap::IndexSet;
-use std::sync::{Arc, atomic::AtomicU32};
 #[cfg(feature = "history")]
-use std::{borrow::Cow, sync::atomic::Ordering};
+use std::borrow::Cow;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, AtomicU64, Ordering},
+};
 
 /// The block height component of a [`FinalizeStorage::MappingUpdateMap`] key, stored as 4 raw bytes.
 ///
@@ -680,11 +683,30 @@ pub trait FinalizeStorage<N: Network>: 'static + Clone + Send + Sync {
     }
 }
 
+/// Owned storage writes from an atomic finalize batch. Entries retain their write order.
+#[derive(Clone)]
+#[allow(clippy::type_complexity)]
+pub struct FinalizeBatch<N: Network> {
+    current_round: Vec<(u8, Option<u64>)>,
+    round_to_height: Vec<(u64, Option<u32>)>,
+    committees: Vec<(u32, Option<snarkvm_ledger_committee::Committee<N>>)>,
+    programs: Vec<(ProgramID<N>, Option<IndexSet<Identifier<N>>>)>,
+    values: Vec<((ProgramID<N>, Identifier<N>), Option<Plaintext<N>>, Option<Value<N>>)>,
+    rejected_reasons: Vec<(Field<N>, Option<RejectedReason<N>>)>,
+    #[cfg(feature = "history")]
+    mapping_updates: Vec<((ProgramID<N>, Identifier<N>, Plaintext<N>, HeightBytes), Option<Value<N>>)>,
+    #[cfg(feature = "history")]
+    mapping_update_heights: Vec<((ProgramID<N>, Identifier<N>, Plaintext<N>), Option<Vec<u32>>)>,
+    #[cfg(feature = "history-staking-rewards")]
+    staking_rewards: Vec<((Address<N>, u32), Option<(Address<N>, u64, u64)>)>,
+}
+
 /// The finalize store.
 #[derive(Clone)]
 pub struct FinalizeStore<N: Network, P: FinalizeStorage<N>> {
     /// The finalize storage.
     storage: P,
+    revision: Arc<AtomicU64>,
     /// PhantomData.
     _phantom: PhantomData<N>,
     /// Tracks the current block height.
@@ -701,11 +723,112 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
     /// Initializes a finalize store from storage.
     pub fn from(storage: P) -> Result<Self> {
         // Return the finalize store.
-        Ok(Self { storage, _phantom: PhantomData, block_height: Arc::new(AtomicU32::new(0)) })
+        Ok(Self {
+            storage,
+            revision: Default::default(),
+            _phantom: PhantomData,
+            block_height: Arc::new(AtomicU32::new(0)),
+        })
+    }
+
+    /// Returns the mutation revisions for the finalize and committee stores.
+    pub fn revision(&self) -> (u64, u64) {
+        (self.revision.load(Ordering::Relaxed), self.storage.committee_store().revision())
+    }
+
+    /// Copies the pending writes without committing or ending the atomic batch.
+    pub fn pending_batch(&self) -> Result<FinalizeBatch<N>> {
+        ensure!(self.is_atomic_in_progress(), "No atomic finalize batch is in progress");
+        macro_rules! pending {
+            ($map:expr) => {
+                $map.iter_pending()
+                    .map(|(key, value)| (key.into_owned(), value.map(|value| value.into_owned())))
+                    .collect()
+            };
+        }
+        let committee = self.storage.committee_store().storage();
+        Ok(FinalizeBatch {
+            current_round: pending!(committee.current_round_map()),
+            round_to_height: pending!(committee.round_to_height_map()),
+            committees: pending!(committee.committee_map()),
+            programs: pending!(self.storage.program_id_map()),
+            values: self
+                .storage
+                .key_value_map()
+                .iter_pending()
+                .map(|(map, key, value)| {
+                    (map.into_owned(), key.map(|key| key.into_owned()), value.map(|value| value.into_owned()))
+                })
+                .collect(),
+            rejected_reasons: pending!(self.storage.rejected_reason_map()),
+            #[cfg(feature = "history")]
+            mapping_updates: pending!(self.storage.mapping_update_map()),
+            #[cfg(feature = "history")]
+            mapping_update_heights: pending!(self.storage.mapping_update_heights_map()),
+            #[cfg(feature = "history-staking-rewards")]
+            staking_rewards: pending!(self.storage.staking_rewards_map()),
+        })
+    }
+
+    /// Queues retained writes in an existing atomic batch. The caller commits or aborts that batch.
+    pub fn apply_pending_batch(&self, batch: FinalizeBatch<N>) -> Result<()> {
+        let committee = self.storage.committee_store().storage();
+        ensure!(
+            committee.current_round_map().is_atomic_in_progress()
+                && committee.round_to_height_map().is_atomic_in_progress()
+                && committee.committee_map().is_atomic_in_progress()
+                && self.storage.program_id_map().is_atomic_in_progress()
+                && self.storage.key_value_map().is_atomic_in_progress()
+                && self.storage.rejected_reason_map().is_atomic_in_progress(),
+            "No complete atomic finalize batch is in progress"
+        );
+        #[cfg(feature = "history")]
+        ensure!(
+            self.storage.mapping_update_map().is_atomic_in_progress()
+                && self.storage.mapping_update_heights_map().is_atomic_in_progress(),
+            "No atomic mapping history batch is in progress"
+        );
+        #[cfg(feature = "history-staking-rewards")]
+        ensure!(
+            self.storage.staking_rewards_map().is_atomic_in_progress(),
+            "No atomic staking rewards batch is in progress"
+        );
+        macro_rules! apply {
+            ($map:expr, $entries:expr) => {
+                for (key, value) in $entries {
+                    match value {
+                        Some(value) => $map.insert(key, value)?,
+                        None => $map.remove(&key)?,
+                    }
+                }
+            };
+        }
+        apply!(committee.current_round_map(), batch.current_round);
+        apply!(committee.round_to_height_map(), batch.round_to_height);
+        apply!(committee.committee_map(), batch.committees);
+        apply!(self.storage.program_id_map(), batch.programs);
+        for (map, key, value) in batch.values {
+            match (key, value) {
+                (Some(key), Some(value)) => self.storage.key_value_map().insert(map, key, value)?,
+                (Some(key), None) => self.storage.key_value_map().remove_key(&map, &key)?,
+                (None, None) => self.storage.key_value_map().remove_map(&map)?,
+                (None, Some(_)) => bail!("Invalid retained finalize write"),
+            }
+        }
+        apply!(self.storage.rejected_reason_map(), batch.rejected_reasons);
+        #[cfg(feature = "history")]
+        {
+            apply!(self.storage.mapping_update_map(), batch.mapping_updates);
+            apply!(self.storage.mapping_update_heights_map(), batch.mapping_update_heights);
+        }
+        #[cfg(feature = "history-staking-rewards")]
+        apply!(self.storage.staking_rewards_map(), batch.staking_rewards);
+        Ok(())
     }
 
     /// Starts an atomic batch write operation.
     pub fn start_atomic(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.start_atomic();
     }
 
@@ -731,11 +854,13 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
 
     /// Aborts an atomic batch write operation.
     pub fn abort_atomic(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.abort_atomic();
     }
 
     /// Finishes an atomic batch write operation.
     pub fn finish_atomic(&self) -> Result<()> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.finish_atomic()
     }
 
@@ -908,6 +1033,7 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStoreTrait<N> for FinalizeStore<
         key: Plaintext<N>,
         value: Value<N>,
     ) -> Result<FinalizeOperation<N>> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.insert_key_value(program_id, mapping_name, key, value)
     }
 
@@ -922,6 +1048,7 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStoreTrait<N> for FinalizeStore<
         key: Plaintext<N>,
         value: Value<N>,
     ) -> Result<FinalizeOperation<N>> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.update_key_value(program_id, mapping_name, key, value)
     }
 
@@ -932,6 +1059,7 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStoreTrait<N> for FinalizeStore<
         mapping_name: Identifier<N>,
         key: &Plaintext<N>,
     ) -> Result<Option<FinalizeOperation<N>>> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.remove_key_value(program_id, mapping_name, key)
     }
 }
@@ -944,6 +1072,7 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
         program_id: ProgramID<N>,
         mapping_name: Identifier<N>,
     ) -> Result<FinalizeOperation<N>> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.initialize_mapping(program_id, mapping_name)
     }
 
@@ -955,6 +1084,7 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
         mapping_name: Identifier<N>,
         entries: Vec<(Plaintext<N>, Value<N>)>,
     ) -> Result<FinalizeOperation<N>> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.replace_mapping(program_id, mapping_name, entries)
     }
 
@@ -965,12 +1095,14 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
         program_id: ProgramID<N>,
         mapping_name: Identifier<N>,
     ) -> Result<FinalizeOperation<N>> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.remove_mapping(program_id, mapping_name)
     }
 
     /// Removes the program for the given `program ID` from storage,
     /// along with all associated mappings and key-value pairs in storage.
     pub fn remove_program(&self, program_id: &ProgramID<N>) -> Result<()> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.remove_program(program_id)
     }
 }
@@ -1079,6 +1211,72 @@ mod tests {
     use console::{program::Literal, types::U64};
 
     type CurrentNetwork = MainnetV0;
+
+    #[test]
+    fn test_pending_finalize_batch() -> Result<()> {
+        check_pending_finalize_batch::<FinalizeMemory<CurrentNetwork>>()
+    }
+
+    #[test]
+    #[cfg(feature = "rocks")]
+    fn test_pending_finalize_batch_rocks() -> Result<()> {
+        check_pending_finalize_batch::<crate::helpers::rocksdb::FinalizeDB<CurrentNetwork>>()
+    }
+
+    fn check_pending_finalize_batch<P: FinalizeStorage<CurrentNetwork>>() -> Result<()> {
+        let store = FinalizeStore::<CurrentNetwork, P>::open(StorageMode::new_test(None))?;
+        let program_id = ProgramID::from_str("batch.aleo")?;
+        let mapping_name = Identifier::from_str("values")?;
+        let key = Plaintext::from_str("1u64")?;
+        let old_value = Value::from_str("2u64")?;
+        let new_value = Value::from_str("3u64")?;
+        store.initialize_mapping(program_id, mapping_name)?;
+        store.insert_key_value(program_id, mapping_name, key.clone(), old_value.clone())?;
+
+        let committee = snarkvm_ledger_committee::test_helpers::sample_committee_for_round(0, &mut TestRng::default());
+        #[cfg(feature = "history")]
+        store.current_block_height().store(1, Ordering::SeqCst);
+        store.start_atomic();
+        store.committee_store().insert(0, committee.clone())?;
+        #[cfg(feature = "history-staking-rewards")]
+        let staker = *committee.members().keys().next().ok_or_else(|| anyhow!("Empty committee"))?;
+        #[cfg(feature = "history-staking-rewards")]
+        store.staking_rewards_map().insert((staker, 1), (staker, 2, 3))?;
+        store.remove_mapping(program_id, mapping_name)?;
+        store.initialize_mapping(program_id, mapping_name)?;
+        store.insert_key_value(program_id, mapping_name, key.clone(), new_value.clone())?;
+        store.atomic_checkpoint();
+        store.update_key_value(program_id, mapping_name, key.clone(), Value::from_str("99u64")?)?;
+        store.atomic_rewind();
+        let batch = store.pending_batch()?;
+        store.abort_atomic();
+        assert_eq!(store.get_value_confirmed(program_id, mapping_name, &key)?, Some(old_value));
+        assert!(store.apply_pending_batch(batch.clone()).is_err());
+        store.committee_store().start_atomic();
+        assert!(store.apply_pending_batch(batch.clone()).is_err());
+        store.committee_store().abort_atomic();
+
+        store.start_atomic();
+        store.apply_pending_batch(batch.clone())?;
+        assert_eq!(store.get_value_speculative(program_id, mapping_name, &key)?, Some(new_value.clone()));
+        store.abort_atomic();
+        store.start_atomic();
+        store.apply_pending_batch(batch)?;
+        store.finish_atomic()?;
+        assert_eq!(store.get_value_confirmed(program_id, mapping_name, &key)?, Some(new_value.clone()));
+        assert_eq!(store.committee_store().current_committee()?, committee);
+        #[cfg(feature = "history-staking-rewards")]
+        assert_eq!(
+            store.staking_rewards_map().get_confirmed(&(staker, 1))?.map(|value| value.into_owned()),
+            Some((staker, 2, 3))
+        );
+        #[cfg(feature = "history")]
+        assert_eq!(
+            store.get_historical_mapping_value(program_id, mapping_name, key, 1)?.map(|value| value.into_owned()),
+            Some(new_value)
+        );
+        Ok(())
+    }
 
     /// Checks `initialize_mapping`, `insert_key_value`, `remove_key_value`, and `remove_mapping`.
     fn check_initialize_insert_remove<N: Network>(

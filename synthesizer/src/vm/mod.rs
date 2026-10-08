@@ -20,6 +20,8 @@ mod authorize;
 mod deploy;
 mod execute;
 mod finalize;
+#[cfg(feature = "reuse-finalize")]
+use finalize::SpeculatedFinalize;
 mod verify;
 
 #[cfg(test)]
@@ -137,6 +139,11 @@ pub struct VM<N: Network, C: ConsensusStorage<N>> {
     /// The list of rejection reasons for pending confirmed transactions.
     /// TODO: it would be cleaner if these are passed along as an argument to `add_next_block`, but this requires a bigger refactor.
     pending_rejected_reasons: Arc<RwLock<HashMap<N::TransactionID, RejectedReason<N>>>>,
+    /// The most recent speculative finalize result, consumed by the next block insertion.
+    #[cfg(feature = "reuse-finalize")]
+    pending_finalize: Arc<Mutex<Option<SpeculatedFinalize<N>>>>,
+    #[cfg(all(test, feature = "reuse-finalize"))]
+    finalize_runs: Arc<std::sync::atomic::AtomicUsize>,
     /// A sender to the channel for operations that must be performed sequentially.
     sequential_ops_tx: Arc<RwLock<Option<mpsc::Sender<SequentialOperationRequest<N>>>>>,
     /// The handle to the thread which processes operations sequentially.
@@ -240,6 +247,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             restrictions: Restrictions::load()?,
             sequential_ops_tx: Default::default(),
             pending_rejected_reasons: Default::default(),
+            #[cfg(feature = "reuse-finalize")]
+            pending_finalize: Default::default(),
+            #[cfg(all(test, feature = "reuse-finalize"))]
+            finalize_runs: Default::default(),
             sequential_ops_thread: Default::default(),
         };
 
@@ -630,6 +641,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             block_synthesis_limit,
         )?;
 
+        #[cfg(feature = "reuse-finalize")]
+        let pending_finalize = self.pending_finalize.lock().take().filter(|pending| {
+            pending.matches(self, state, block.ratifications(), block.solutions(), block.transactions())
+        });
+
         // Pause the atomic writes, so that both the insertion and finalization belong to a single batch.
         #[cfg(feature = "rocks")]
         self.block_store().pause_atomic_writes()?;
@@ -649,7 +665,14 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         };
 
         // Next, finalize the transactions.
-        match self.finalize(state, block.ratifications(), block.solutions(), block.transactions()) {
+        #[cfg(feature = "reuse-finalize")]
+        let finalized = match pending_finalize {
+            Some(pending) => self.commit_speculated_finalize(pending),
+            None => self.finalize(state, block.ratifications(), block.solutions(), block.transactions()),
+        };
+        #[cfg(not(feature = "reuse-finalize"))]
+        let finalized = self.finalize(state, block.ratifications(), block.solutions(), block.transactions());
+        match finalized {
             Ok(_ratified_finalize_operations) => {
                 // If the block advances to `ConsensusVersion::V8`, updated the VKs used for the credits program.
                 if N::CONSENSUS_HEIGHT(ConsensusVersion::V8).unwrap_or_default() == block.height() {

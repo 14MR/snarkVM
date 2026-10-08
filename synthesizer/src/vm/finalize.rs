@@ -28,6 +28,52 @@ use snarkvm_synthesizer_error::{
 };
 use snarkvm_utilities::{cfg_sort_by_cached_key, defer, dev_eprintln};
 
+/// A VM-local result whose writes apply only to the recorded parent and finalize inputs.
+#[cfg(feature = "reuse-finalize")]
+pub(super) struct SpeculatedFinalize<N: Network> {
+    checked: bool,
+    state: FinalizeGlobalState,
+    parent_state_root: N::StateRoot,
+    store_revision: (u64, u64),
+    ratifications: Ratifications<N>,
+    solutions: Solutions<N>,
+    transactions: Vec<ConfirmedTransaction<N>>,
+    writes: snarkvm_ledger_store::FinalizeBatch<N>,
+    stacks: Vec<Arc<snarkvm_synthesizer_process::Stack<N>>>,
+    rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
+    ratified_finalize_operations: Vec<FinalizeOperation<N>>,
+}
+
+#[cfg(feature = "reuse-finalize")]
+impl<N: Network> SpeculatedFinalize<N> {
+    pub(super) fn matches<C: ConsensusStorage<N>>(
+        &self,
+        vm: &VM<N, C>,
+        state: FinalizeGlobalState,
+        ratifications: &Ratifications<N>,
+        solutions: &Solutions<N>,
+        transactions: &Transactions<N>,
+    ) -> bool {
+        self.checked && self.matches_inputs(vm, state, ratifications, solutions, transactions)
+    }
+
+    fn matches_inputs<C: ConsensusStorage<N>>(
+        &self,
+        vm: &VM<N, C>,
+        state: FinalizeGlobalState,
+        ratifications: &Ratifications<N>,
+        solutions: &Solutions<N>,
+        transactions: &Transactions<N>,
+    ) -> bool {
+        self.state == state
+            && self.parent_state_root == vm.block_store().current_state_root()
+            && self.store_revision == vm.finalize_store().revision()
+            && &self.ratifications == ratifications
+            && &self.solutions == solutions
+            && self.transactions.iter().eq(transactions.iter())
+    }
+}
+
 /// Uniqueness tracking accumulated while assembling a candidate block's transactions.
 struct CandidateTransactionDetails<N: Network> {
     /// The IDs of the transitions in this block.
@@ -254,6 +300,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         // where any aborted transactions should be in the aborted transaction ID list, not in transactions.
         ensure!(aborted_transactions.is_empty(), "Aborted transactions found in the block (from speculation)");
 
+        #[cfg(feature = "reuse-finalize")]
+        if let Some(pending) = self.pending_finalize.lock().as_mut()
+            && pending.matches_inputs(self, state, ratifications, solutions, transactions)
+        {
+            pending.checked = true;
+        }
         finish!(timer, "Finished dry-run of the transactions");
 
         // Return the ratified finalize operations.
@@ -439,6 +491,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         solutions: &Solutions<N>,
         transactions: &Transactions<N>,
     ) -> Result<Vec<FinalizeOperation<N>>> {
+        #[cfg(feature = "reuse-finalize")]
+        self.pending_finalize.lock().take();
         let timer = timer!("VM::finalize");
 
         // Performs a **real-run** of finalize over the list of ratifications, solutions, and transactions.
@@ -524,6 +578,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     )> {
         self.ensure_sequential_processing();
 
+        #[cfg(feature = "reuse-finalize")]
+        self.pending_finalize.lock().take();
+        #[cfg(feature = "reuse-finalize")]
+        let mut pending_finalize = None;
+
         let timer = timer!("VM::atomic_speculate");
 
         // Retrieve the number of solutions.
@@ -553,7 +612,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             .store(state.block_height(), std::sync::atomic::Ordering::SeqCst);
 
         // Perform the finalize operation on the preset finalize mode.
-        atomic_finalize!(self.finalize_store(), FinalizeMode::DryRun, {
+        let result = atomic_finalize!(self.finalize_store(), FinalizeMode::DryRun, {
             // Ensure the number of solutions does not exceed the maximum.
             if num_solutions > max_aborted_solutions {
                 // Note: This will abort the entire atomic batch.
@@ -924,11 +983,78 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                 return Err("Failed to construct the ratifications after speculation".to_string());
             };
 
+            #[cfg(feature = "reuse-finalize")]
+            {
+                let stacks = confirmed
+                    .iter()
+                    .filter_map(|transaction| match transaction {
+                        ConfirmedTransaction::AcceptedDeploy(_, Transaction::Deploy(_, _, _, deployment, _), _) => {
+                            Some(process.get_stack(deployment.program_id()).map_err(|error| error.to_string()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                pending_finalize = Some(SpeculatedFinalize {
+                    checked: false,
+                    state,
+                    parent_state_root: self.block_store().current_state_root(),
+                    store_revision: self.finalize_store().revision(),
+                    ratifications: ratifications.clone(),
+                    solutions: solutions.clone(),
+                    transactions: confirmed.clone(),
+                    writes: store.pending_batch().map_err(|error| error.to_string())?,
+                    stacks,
+                    rejected_reasons: self.pending_rejected_reasons.read().clone(),
+                    ratified_finalize_operations: ratified_finalize_operations.clone(),
+                });
+            }
             finish!(timer);
 
             // On return, 'atomic_finalize!' will abort the batch, and return the ratifications,
             // confirmed & aborted transactions, and finalize operations from pre-ratify and post-ratify.
             Ok((ratifications, confirmed, aborted, ratified_finalize_operations))
+        });
+        #[cfg(feature = "reuse-finalize")]
+        if result.is_ok() {
+            if let Some(pending) = &mut pending_finalize {
+                pending.store_revision = self.finalize_store().revision();
+            }
+            *self.pending_finalize.lock() = pending_finalize;
+        }
+        result
+    }
+
+    /// Commits the writes and process stacks retained by successful speculation.
+    #[cfg(feature = "reuse-finalize")]
+    pub(super) fn commit_speculated_finalize(
+        &self,
+        pending: SpeculatedFinalize<N>,
+    ) -> Result<Vec<FinalizeOperation<N>>> {
+        self.ensure_sequential_processing();
+        let store = self.finalize_store();
+        #[cfg(feature = "history")]
+        store.current_block_height().store(pending.state.block_height(), std::sync::atomic::Ordering::SeqCst);
+        store.block_height().store(pending.state.block_height(), std::sync::atomic::Ordering::SeqCst);
+
+        atomic_finalize!(store, FinalizeMode::RealRun, {
+            let process = self.process.lock();
+            defer! { process.revert_stacks(); }
+            store.apply_pending_batch(pending.writes).map_err(|error| error.to_string())?;
+            for transaction in &pending.transactions {
+                if transaction.is_rejected() {
+                    let id = transaction.id();
+                    if let Some(reason) = pending.rejected_reasons.get(&id) {
+                        store.insert_rejected_reason(*id, reason.clone()).map_err(|error| error.to_string())?;
+                        self.pending_rejected_reasons.write().remove(&id);
+                    }
+                }
+            }
+            for stack in pending.stacks {
+                process.stage_stack(Arc::unwrap_or_clone(stack));
+            }
+            process.commit_stacks();
+            trace!("Committed retained finalize result at height {}", pending.state.block_height());
+            Ok(pending.ratified_finalize_operations)
         })
     }
 
@@ -947,6 +1073,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         #[cfg(not(test))]
         self.ensure_sequential_processing();
 
+        #[cfg(all(test, feature = "reuse-finalize"))]
+        self.finalize_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let timer = timer!("VM::atomic_finalize");
 
         // Update the block height used for the purposes of historical mapping accounting.
@@ -2015,6 +2143,155 @@ finalize transfer_public:
         let next_block = sample_next_block(vm, private_key, &[transaction], previous_block, unspent_records, rng)?;
 
         Ok((program_name, next_block))
+    }
+
+    #[cfg(feature = "reuse-finalize")]
+    fn check_finalize_for_block(
+        vm: &VM<CurrentNetwork, LedgerType>,
+        block: &Block<CurrentNetwork>,
+        rng: &mut TestRng,
+    ) -> Result<()> {
+        let timestamp =
+            (block.height() >= CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V12)?).then_some(block.timestamp());
+        let (spend, synthesis) = Authority::<CurrentNetwork>::beacon_limits(block.height());
+        let state = FinalizeGlobalState::new::<CurrentNetwork>(
+            block.round(),
+            block.height(),
+            timestamp,
+            block.cumulative_weight(),
+            block.cumulative_proof_target(),
+            block.previous_hash(),
+            spend,
+            synthesis,
+        )?;
+        vm.check_speculate(
+            state,
+            CurrentNetwork::BLOCK_TIME as i64,
+            block.ratifications(),
+            block.solutions(),
+            block.transactions(),
+            rng,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "reuse-finalize")]
+    fn test_reuse_finalize_matches_reexecution() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let rng = &mut TestRng::default();
+        let vm = test_helpers::sample_vm_with_genesis_block(rng);
+        let baseline = test_helpers::sample_vm_with_genesis_block(rng);
+        let private_key = test_helpers::sample_genesis_private_key(rng);
+        let genesis = test_helpers::sample_genesis_block(rng);
+        let deployment = test_helpers::sample_deployment_transaction(rng);
+        let block = sample_next_block(&vm, &private_key, &[deployment], &genesis, &mut vec![], rng)?;
+        check_finalize_for_block(&vm, &block, rng)?;
+        assert!(vm.pending_finalize.lock().is_some());
+        assert!(!vm.contains_program(&ProgramID::from_str("testing.aleo")?));
+        let runs = vm.finalize_runs.load(Ordering::Relaxed);
+        vm.add_next_block(&block)?;
+        assert_eq!(vm.finalize_runs.load(Ordering::Relaxed), runs);
+        assert!(vm.pending_finalize.lock().is_none());
+        assert!(vm.contains_program(&ProgramID::from_str("testing.aleo")?));
+        baseline.add_next_block(&block)?;
+        assert_eq!(vm.finalize_store().get_checksum_confirmed()?, baseline.finalize_store().get_checksum_confirmed()?);
+        assert_eq!(
+            vm.finalize_store().committee_store().current_committee()?,
+            baseline.finalize_store().committee_store().current_committee()?
+        );
+
+        let recipient = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng)?)?;
+        let inputs = [recipient.to_string(), "1u64".to_string()];
+        let transfer =
+            vm.execute(&private_key, ("credits.aleo", "transfer_public"), inputs.iter(), None, 0, None, rng)?;
+        let rejected_inputs = [recipient.to_string(), "18446744073709551615u64".to_string()];
+        let rejected =
+            vm.execute(&private_key, ("credits.aleo", "transfer_public"), rejected_inputs.iter(), None, 0, None, rng)?;
+        let next_block = sample_next_block(&vm, &private_key, &[transfer, rejected], &block, &mut vec![], rng)?;
+        assert!(next_block.transactions().iter().any(|transaction| transaction.is_rejected()));
+        check_finalize_for_block(&vm, &next_block, rng)?;
+        check_finalize_for_block(&baseline, &next_block, rng)?;
+        baseline.pending_finalize.lock().take();
+        vm.add_next_block(&next_block)?;
+        baseline.add_next_block(&next_block)?;
+        assert_eq!(vm.finalize_runs.load(Ordering::Relaxed), runs);
+        assert_eq!(vm.finalize_store().get_checksum_confirmed()?, baseline.finalize_store().get_checksum_confirmed()?);
+        assert_eq!(
+            vm.finalize_store().committee_store().current_committee()?,
+            baseline.finalize_store().committee_store().current_committee()?
+        );
+        for transaction in next_block.transactions().iter().filter(|transaction| transaction.is_rejected()) {
+            assert_eq!(
+                vm.finalize_store().get_rejected_reason(&transaction.id())?,
+                baseline.finalize_store().get_rejected_reason(&transaction.id())?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "reuse-finalize")]
+    fn test_reuse_finalize_rejects_changed_inputs_and_state() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let rng = &mut TestRng::default();
+        let vm = test_helpers::sample_vm_with_genesis_block(rng);
+        let key = test_helpers::sample_genesis_private_key(rng);
+        let genesis = test_helpers::sample_genesis_block(rng);
+        let block = sample_next_block(&vm, &key, &[], &genesis, &mut vec![], rng)?;
+        {
+            let retained = vm.pending_finalize.lock();
+            let pending = retained.as_ref().ok_or_else(|| anyhow!("Missing retained result"))?;
+            assert!(pending.matches_inputs(
+                &vm,
+                pending.state,
+                block.ratifications(),
+                block.solutions(),
+                block.transactions()
+            ));
+            assert!(!pending.matches(
+                &vm,
+                pending.state,
+                block.ratifications(),
+                block.solutions(),
+                block.transactions()
+            ));
+        }
+        check_finalize_for_block(&vm, &block, rng)?;
+        {
+            let retained = vm.pending_finalize.lock();
+            let pending = retained.as_ref().ok_or_else(|| anyhow!("Missing retained result"))?;
+            assert!(pending.matches(
+                &vm,
+                pending.state,
+                block.ratifications(),
+                block.solutions(),
+                block.transactions()
+            ));
+            assert!(!pending.matches(
+                &vm,
+                sample_finalize_state(block.height() + 1),
+                block.ratifications(),
+                block.solutions(),
+                block.transactions()
+            ));
+            let ratifications = Ratifications::try_from_iter([Ratify::BlockReward(1), Ratify::PuzzleReward(0)])?;
+            assert!(!pending.matches(&vm, pending.state, &ratifications, block.solutions(), block.transactions()));
+            vm.finalize_store().start_atomic();
+            vm.finalize_store().abort_atomic();
+            assert!(!pending.matches(
+                &vm,
+                pending.state,
+                block.ratifications(),
+                block.solutions(),
+                block.transactions()
+            ));
+        }
+        let runs = vm.finalize_runs.load(Ordering::Relaxed);
+        vm.add_next_block(&block)?;
+        assert_eq!(vm.finalize_runs.load(Ordering::Relaxed), runs + 1);
+        assert!(vm.pending_finalize.lock().is_none());
+        Ok(())
     }
 
     /// Construct a new block based on the given transactions.

@@ -23,6 +23,10 @@ use snarkvm_ledger_committee::Committee;
 use aleo_std_storage::StorageMode;
 use anyhow::Result;
 use core::marker::PhantomData;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 const ROUND_KEY: u8 = 0;
 
@@ -281,6 +285,7 @@ pub trait CommitteeStorage<N: Network>: 'static + Clone + Send + Sync {
 pub struct CommitteeStore<N: Network, C: CommitteeStorage<N>> {
     /// The committee storage.
     storage: C,
+    revision: Arc<AtomicU64>,
     /// PhantomData.
     _phantom: PhantomData<N>,
 }
@@ -291,16 +296,25 @@ impl<N: Network, C: CommitteeStorage<N>> CommitteeStore<N, C> {
         // Initialize the committee storage.
         let storage = C::open(storage)?;
         // Return the committee store.
-        Ok(Self { storage, _phantom: PhantomData })
+        Ok(Self { storage, revision: Default::default(), _phantom: PhantomData })
     }
 
     /// Initializes a committee store from storage.
     pub fn from(storage: C) -> Self {
-        Self { storage, _phantom: PhantomData }
+        Self { storage, revision: Default::default(), _phantom: PhantomData }
+    }
+
+    pub(crate) fn storage(&self) -> &C {
+        &self.storage
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     /// Starts an atomic batch write operation.
     pub fn start_atomic(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.start_atomic();
     }
 
@@ -326,11 +340,13 @@ impl<N: Network, C: CommitteeStorage<N>> CommitteeStore<N, C> {
 
     /// Aborts an atomic batch write operation.
     pub fn abort_atomic(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.abort_atomic();
     }
 
     /// Finishes an atomic batch write operation.
     pub fn finish_atomic(&self) -> Result<()> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.finish_atomic()
     }
 
@@ -344,12 +360,14 @@ impl<N: Network, C: CommitteeStorage<N>> CommitteeStore<N, C> {
     /// Stores the given `(next height, committee)` pair into storage,
     /// and indexes storage up to the `next round`.
     pub fn insert(&self, next_height: u32, committee: Committee<N>) -> Result<()> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.insert(next_height, committee)
     }
 
     /// Removes the committee for the given `height`, in the process
     /// removing all round to height entries back to the previous committee.
     pub fn remove(&self, height: u32) -> Result<()> {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         self.storage.remove(height)
     }
 }
