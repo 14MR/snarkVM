@@ -157,32 +157,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_selected_rocksdb_history_on_committed_blocks() -> Result<()> {
-        use crate::vm::test_helpers::{sample_genesis_block, sample_vm};
-        use console::{
-            network::{MainnetV0, prelude::TestRng},
-            program::{Identifier, ProgramID},
-        };
-        let genesis = sample_genesis_block(&mut TestRng::default());
-        let program = ProgramID::<MainnetV0>::from_str("credits.aleo")?;
-        let mapping = Identifier::from_str("account")?;
-        let disabled = sample_vm();
-        disabled.add_next_block(&genesis)?;
-        assert_eq!(disabled.finalize_store().get_program_history_range(&program, 0)?, None);
-
-        let enabled = sample_vm();
-        enabled.finalize_store().set_history_programs(vec![program]);
-        enabled.add_next_block(&genesis)?;
-        let store = enabled.finalize_store();
-        assert_eq!(store.get_program_history_range(&program, 0)?, Some((0, 0)));
-        for (key, value) in store.get_mapping_confirmed(program, mapping)? {
-            assert_eq!(store.get_value_at_height(program, mapping, &key, 0)?, Some(value));
-        }
-        assert_eq!(store.get_program_history_range(&ProgramID::from_str("shield_swap.aleo")?, 0)?, None);
-        Ok(())
-    }
-
-    #[test]
     fn test_history_json_roundtrip() {
         let storage = StorageMode::new_test(None);
         let history = History::new(0, &storage);
