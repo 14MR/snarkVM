@@ -582,6 +582,8 @@ pub struct FinalizeStore<N: Network, P: FinalizeStorage<N>> {
     record_history_json: Arc<AtomicBool>,
     /// Programs whose mapping writes are retained in the canonical finalize batch.
     history_programs: Arc<RwLock<Vec<ProgramID<N>>>>,
+    /// Whether canonical finalize retains mapping history for every program.
+    archival: Arc<AtomicBool>,
 }
 
 impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
@@ -599,6 +601,7 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
             block_height: Arc::new(AtomicU32::new(0)),
             record_history_json: Arc::new(AtomicBool::new(false)),
             history_programs: Arc::new(RwLock::new(Vec::new())),
+            archival: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -622,9 +625,23 @@ impl<N: Network, P: FinalizeStorage<N>> FinalizeStore<N, P> {
         self.history_programs.read().clone()
     }
 
-    /// Queues selected program history in the current canonical finalize batch.
+    /// Enables or disables mapping history for every program, including new deployments.
+    pub fn set_archival(&self, enabled: bool) {
+        self.archival.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Queues program history in the current canonical finalize batch.
     pub fn record_program_history(&self, height: u32) -> Result<()> {
-        let programs = self.history_programs();
+        let programs: IndexSet<_> = if self.archival.load(Ordering::SeqCst) {
+            self.storage
+                .program_id_map()
+                .keys_confirmed()
+                .map(|program| program.into_owned())
+                .chain(self.storage.program_id_map().iter_pending().map(|(program, _)| program.into_owned()))
+                .collect()
+        } else {
+            self.history_programs().into_iter().collect()
+        };
         if programs.is_empty() {
             return Ok(());
         }
